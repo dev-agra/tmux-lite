@@ -28,13 +28,19 @@ PREFIX_KEY = b"\x02"  # Ctrl-B.
 class NullObserver:
     """Default no-op observer. Part 2 will replace/subclass this."""
 
-    def on_pane_output(self, pane_id, data, is_focused):
+    def on_pane_created(self, pane):
         pass
+
+    def on_pane_output(self, pane_id, data, is_focused):
+        return data  # identity: Part 1 doesn't need to transform output
 
     def on_focus_change(self, old_pane_id, new_pane_id):
         pass
 
-    def on_pane_closed(self, pane_id, exit_status):
+    def on_pane_closed(self, pane_id, exit_status, is_focused):
+        pass
+
+    def on_tick(self, panes, focused_id):
         pass
 
 
@@ -59,6 +65,7 @@ class Multiplexer:
         pane.start()
         self.panes[pane.pane_id] = pane
         self._next_id += 1
+        self.observer.on_pane_created(pane)
         # New panes take focus immediately (matches tmux's behaviour and
         # is what a user pressing "create pane" expects to happen).
         old_id = self.focused_id
@@ -94,8 +101,12 @@ class Multiplexer:
             self._reap(pane)
 
     def _reap(self, pane):
+        # Captured before popping: whether this pane was the focused one
+        # at the moment it closed is what "currently focused" means for
+        # the purposes of suppressing a notification (see DECISIONS.md).
+        is_focused = pane.pane_id == self.focused_id
         self.panes.pop(pane.pane_id, None)
-        self.observer.on_pane_closed(pane.pane_id, pane.exit_status)
+        self.observer.on_pane_closed(pane.pane_id, pane.exit_status, is_focused)
         if self.focused_id == pane.pane_id:
             self.focused_id = next(iter(self.panes), None)
             self._write_status()
@@ -216,9 +227,16 @@ class Multiplexer:
                         self._reap(pane)
                         continue
                     is_focused = pane.pane_id == self.focused_id
-                    self.observer.on_pane_output(pane.pane_id, data, is_focused)
+                    # on_pane_output may strip an invisible marker (Part 2)
+                    # before the bytes ever reach the real screen.
+                    data = self.observer.on_pane_output(pane.pane_id, data, is_focused)
                     if is_focused and data:
                         os.write(stdout_fd, data)
+
+            # Runs every tick regardless of I/O (piggybacking on the
+            # select() timeout above) so pgrp-transition polling for Part 2
+            # doesn't need a second timer -- see DECISIONS.md.
+            self.observer.on_tick(self.panes, self.focused_id)
 
     def shutdown(self):
         """Best-effort cleanup: make sure no pane shells are left running

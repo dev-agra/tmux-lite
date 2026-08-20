@@ -10,11 +10,12 @@ import signal
 import sys
 
 from .multiplexer import Multiplexer
+from .notifier import CompletionObserver
 from .terminal import RawTerminal
 
 
 def main(argv=None):
-    mux = Multiplexer()
+    mux = Multiplexer(observer=CompletionObserver())
 
     def on_winch(signum, frame):
         mux.request_resize()

@@ -1,11 +1,11 @@
-# tmux-lite (Part 1)
+# tmux-lite
 
-A simplified terminal multiplexer. Python 3.11+, standard library only.
+A simplified terminal multiplexer with completion notifications. Python
+3.11+, standard library only.
 
-This submission covers **Part 1** (the multiplexer substrate) only. Part 2
-(completion notifications) is not implemented yet — see "What's next"
-below. Everything here is built so Part 2 can be added without changing
-this code's structure (see `Multiplexer.observer` hooks).
+Both Part 1 (the multiplexer) and Part 2 (completion notifications) are
+implemented. See DECISIONS.md for the reasoning behind every non-obvious
+choice, including two real bugs found and fixed during testing.
 
 ## Running it
 
@@ -13,8 +13,9 @@ this code's structure (see `Multiplexer.observer` hooks).
 python3 -m tmuxlite.main
 ```
 
-Run it from a real terminal (not redirected/piped). It will start your
-`$SHELL` (falls back to `/bin/sh`) in pane 1.
+Run it from a real terminal (not redirected/piped). It starts your
+`$SHELL` in pane 1 (falling back to `bash` on `$PATH`, then `/bin/sh` --
+see DECISIONS.md for why the fallback isn't just `/bin/sh`).
 
 ## Prefix key and commands
 
@@ -40,6 +41,37 @@ limitations below.
 
 The program exits automatically once the last pane's shell exits.
 
+## Completion notifications (Part 2)
+
+When a command finishes in a pane you're *not* currently looking at,
+tmux-lite tells you -- as a status line + terminal bell written to your
+real screen (`[pane 2 finished: exit 3, 5.0s]`), plus a best-effort
+desktop notification via `notify-send` (Linux) or `osascript` (macOS) if
+one of those is on `$PATH`.
+
+**What counts as "a command finished"**, in short: the terminal's
+foreground process group reverting from some other process back to the
+shell's own process group -- a real kernel fact we poll via `TIOCGPGRP`,
+not a guess about output. Exit status comes from a small, invisible hook
+injected into bash/zsh at pane startup. Full reasoning, including the
+alternatives considered and rejected, is in DECISIONS.md.
+
+**Rules applied before anything is shown:**
+- Never notified for the pane you're currently focused on.
+- Only notified if the command ran for at least 2 seconds (tunable
+  constant in `notifier.py`, `DEFAULT_THRESHOLD_SECONDS`) -- `ls`, `cd`,
+  `echo` etc. won't spam you.
+- Sitting inside an interactive program (vim, less, htop, or anything
+  else that holds the foreground continuously) produces zero
+  notifications until it actually exits, however long you sit there.
+
+**Shell coverage:** bash and zsh get exact exit statuses via an injected
+prompt hook. Other shells (fish, dash, plain `sh`, csh/tcsh) still get
+correct start/finish *timing* (that part is shell-agnostic, since it's
+pure kernel pgrp tracking), but the notification will show `exit
+unknown` instead of a real status, since there's no equivalent hook
+mechanism implemented for them here.
+
 ## What works
 
 - Single pane running a real shell, full interactive behaviour (tested
@@ -61,6 +93,23 @@ The program exits automatically once the last pane's shell exits.
   termios flags before/during/after, not just by inspection of the code.
 - Pane cleanup: a pane whose shell exits is removed from the pane list;
   the program exits once none remain.
+- Completion notifications, verified end-to-end against a real PTY and
+  real bash for every scenario in the assignment's graded checklist:
+  - `sleep 5; exit 3` in an unfocused pane → exactly one notification,
+    exit status 3 (this scenario ends the pane's *shell*, not just a
+    subcommand -- see DECISIONS.md on why that needed its own code path).
+  - A failing command where the shell survives afterwards → one
+    notification with the correct non-zero status, pane confirmed still
+    alive and usable afterward.
+  - A long-sitting interactive foreground process (tested with `cat`
+    blocked on stdin, standing in for vim/less/htop, which weren't
+    installable in the sandbox this was built in) → zero notifications
+    while inside it, however long you sit there.
+  - A fast command (`ls`) → no notification.
+  - A long command that runs while its pane stays focused the whole
+    time → no notification, ever.
+  - All five are exercised by real, non-mocked integration tests in
+    `tests/test_notifier_integration.py`, not just claimed.
 
 ## What does not work / known limitations
 
@@ -83,6 +132,23 @@ The program exits automatically once the last pane's shell exits.
 - **Only SIGTERM/SIGHUP are caught for terminal restoration**, not every
   signal that could kill us (e.g. SIGKILL cannot be caught by any
   process — that's a hard OS limitation, not a gap in our handling).
+- **Exit status is unknown for non-bash/zsh shells** (fish, dash, `sh`,
+  csh/tcsh). Completion timing still works for them (pgrp tracking is
+  shell-agnostic), but the notification shows `exit unknown` since no
+  equivalent startup-hook mechanism is implemented for those shells.
+- **Backgrounded jobs (`cmd &`) are invisible to detection.** They never
+  take the terminal's foreground process group, so our pgrp-based
+  definition of "a command finished" never fires for them. Arguably in
+  scope for the shell's own job-control notifications (`[1]+ Done`)
+  rather than ours.
+- **Compound lines (`cmd1; cmd2; cmd3`) produce multiple notifications**,
+  one per foreground handoff -- correct under our definition of "a
+  command" (one pgrp handoff = one command), but worth knowing it's not
+  "one notification per Enter keypress."
+- **A process that daemonizes and returns control to the shell early**
+  will be reported "finished" while its real work continues invisibly
+  in the background. Inherent to pgrp-based detection; not fixable
+  without program-specific knowledge.
 - No detach/reattach, no scrollback/copy mode, no resizable layout tree —
   all explicitly Part 3, not attempted here.
 
@@ -106,6 +172,22 @@ same way a real shell would), and inspect the slave's termios ECHO/ICANON
 flags before, during, and after — for both a clean exit and a SIGTERM
 kill.
 
+`tests/test_notifier.py` — unit tests for `CompletionObserver`'s decision
+logic (threshold, focus suppression, exactly-one-notification, marker
+correlation, marker reassembly across split reads) with `TIOCGPGRP`
+polling and the clock monkeypatched to fake values. These are fast,
+deterministic, and specifically what caught the logic bugs during
+development, but they cannot catch a bug in the *real* pgrp-polling
+plumbing itself, since the polling is faked out.
+
+`tests/test_notifier_integration.py` — real end-to-end tests against the
+actual `tmuxlite.main` entry point, a real PTY, and real bash panes,
+covering every scenario in the assignment's graded checklist for Part 2.
+These exist because they're the only thing that actually caught a real
+bug (see DECISIONS.md): a race condition in reading the shell's resting
+process group right after fork, which the faked-pgrp unit tests above
+structurally cannot detect since they never touch a real fork.
+
 **What's deliberately not unit tested**: `vim` reflow on resize, `htop`
 rendering correctly, and general "does this feel right interactively"
 behaviour. These live in real terminal-emulator behaviour that's
@@ -113,26 +195,32 @@ impractical to assert on programmatically without writing a terminal
 emulator ourselves (which is exactly the complexity Part 1 is scoped to
 avoid). These were checked manually during development and are called
 out here rather than papered over with a test that doesn't actually
-prove anything.
+prove anything. (Also worth noting: `vim` wasn't installable in the
+sandbox this was built in, so its specific Part-2 checklist item was
+verified with `cat` instead, as a stand-in for "a foreground program
+that blocks indefinitely and doesn't hand control back until it exits.")
 
 Run tests with:
 ```
 pip install pytest --break-system-packages   # if not already available
 python3 -m pytest tests/ -v
 ```
+The integration test files fork real processes and run real `sleep`
+commands, so the full suite takes roughly 30-40 seconds rather than
+being instant.
 
 ## What's next (not done, and why)
 
-- **Part 2 (completion notifications)** — the actual point of the full
-  assignment. Not implemented in this submission. The extension point
-  is already in place: `Multiplexer.observer` is called on every pane
-  output event, focus change, and pane close; a real implementation
-  would replace `NullObserver` with something that watches the pane's
-  foreground process group (via the PTY) and timing to infer command
-  completion, then surfaces a notification when the relevant pane isn't
-  focused. See the parent assignment's DECISIONS.md requirements for
-  what that write-up needs to cover once built.
-- A persistent status bar (would need escape-sequence parsing).
-- Config for prefix key / shell path via CLI flags or a config file —
-  currently hardcoded, which is fine for an assignment but would be an
-  early ask in real use.
+- **Exit-status marker support for shells other than bash/zsh.** fish
+  uses a different hook mechanism (`fish_prompt`/`fish_postexec`
+  events); dash/`sh`/csh have no equivalent hook at all. Timing-only
+  detection would still work for those, just without a real exit code.
+- **A persistent status bar** (would need escape-sequence parsing —
+  Part 3 scope).
+- **Config for prefix key / shell path / notification threshold** via
+  CLI flags or a config file — currently hardcoded constants, fine for
+  an assignment but an early ask in real use.
+- **Coalescing multiple notifications** if several unfocused panes
+  finish in a burst — right now each gets its own line, which could get
+  noisy with many panes; not attempted since the assignment scopes to
+  two panes.
